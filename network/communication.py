@@ -201,10 +201,32 @@ class Connection:
                 # Read message data with timeout
                 message_data = await asyncio.wait_for(
                     self.reader.readexactly(message_length),
-                    timeout=20.0  # Longer timeout for larger messages
+                    timeout=30.0  # Extended timeout for larger messages or network delays
                 )
             except asyncio.TimeoutError:
                 logger.warning(f"Timeout reading message from {self.node_id}")
+                # Don't immediately mark connection as disconnected
+                # Instead, we'll try a ping to see if connection is still active
+                try:
+                    # Try to write a small ping packet to test connection
+                    self.writer.write(b'\x00\x00\x00\x01\x00')  # Minimal ping
+                    await self.writer.drain()
+                    logger.debug(f"Sent probe ping to {self.node_id}")
+                    
+                    # Try to read response
+                    probe_response = await asyncio.wait_for(self.reader.read(1), timeout=2.0)
+                    if probe_response:
+                        logger.info(f"Connection to {self.node_id} is still responsive despite timeout")
+                        # Connection seems alive but message reading timed out
+                        # This is partial fail, but we'll allow another attempt
+                        return None
+                except Exception:
+                    # If ping fails, connection is really gone
+                    logger.warning(f"Connection to {self.node_id} confirmed dead after probe")
+                    self.connected = False
+                    return None
+                
+                # If we get here, ping didn't work
                 self.connected = False
                 return None
             
@@ -362,51 +384,116 @@ class MessageHandler:
         logger.info(f"New connection from {peer_addr}")
         
         try:
-            # Wait for handshake message with timeout and retries
+            # Improved handshake reception with enhanced retry mechanism
             message = None
-            retries = 3
-            timeout = 5.0
+            retries = 5  # Increased from 3 to 5 for better reliability
+            base_timeout = 5.0
             
-            while not message and retries > 0:
+            # Send a pre-handshake welcome message to confirm connection is viable
+            try:
+                welcome = Message(
+                    message_id=str(uuid.uuid4()),
+                    message_type=MessageType.PING,
+                    source_id=self.node_id,
+                    target_id="unknown",
+                    data={
+                        "status": "welcome",
+                        "server_time": time.time(),
+                        "message": "Connection established, waiting for handshake"
+                    }
+                )
+                await conn.send_message(welcome)
+                logger.debug(f"Sent welcome message to {peer_addr}")
+            except Exception as e:
+                logger.warning(f"Failed to send welcome to {peer_addr}: {e}")
+                # Continue anyway - the welcome is just an optimization
+            
+            # Enhanced handshake reception loop with better error handling
+            for retry in range(retries):
+                # Calculate timeout with exponential backoff
+                timeout = base_timeout * (1.5 ** retry)
+                
                 try:
+                    logger.info(f"Waiting for handshake from {peer_addr} (attempt {retry+1}/{retries}, timeout: {timeout:.1f}s)")
                     message = await asyncio.wait_for(conn.receive_message(), timeout=timeout)
                     
                     if not message:
-                        logger.warning(f"Empty handshake from {peer_addr}, retries left: {retries-1}")
-                        retries -= 1
-                        timeout += 1.0  # Gradually increase timeout
-                        await asyncio.sleep(0.5)  # Short delay before retry
+                        logger.warning(f"Empty handshake message from {peer_addr} (attempt {retry+1}/{retries})")
+                        # Send another welcome message as a prompt
+                        try:
+                            welcome.data["retry"] = retry
+                            welcome.data["server_time"] = time.time()
+                            await conn.send_message(welcome)
+                        except Exception:
+                            pass  # Ignore errors here
+                        await asyncio.sleep(0.5)
                         continue
                     
+                    # Validate message type
                     if message.message_type != MessageType.HANDSHAKE:
-                        logger.warning(f"Invalid handshake type from {peer_addr}: {message.message_type}")
-                        # Send proper rejection response
+                        logger.warning(f"Received non-handshake message type from {peer_addr}: {message.message_type}")
+                        
+                        # If this is a PING, respond with PONG but keep waiting for handshake
+                        if message.message_type == MessageType.PING:
+                            try:
+                                pong = Message(
+                                    message_id=str(uuid.uuid4()),
+                                    message_type=MessageType.PONG,
+                                    source_id=self.node_id,
+                                    target_id=message.source_id or "unknown",
+                                    data={
+                                        "echo": message.data,
+                                        "server_time": time.time(),
+                                        "message": "Still waiting for proper handshake"
+                                    }
+                                )
+                                await conn.send_message(pong)
+                            except Exception:
+                                pass  # Ignore errors
+                            await asyncio.sleep(0.5)
+                            continue
+                        
+                        # For other message types, reject explicitly
                         rejection = Message(
                             message_id=str(uuid.uuid4()),
                             message_type=MessageType.HANDSHAKE,
                             source_id=self.node_id,
-                            target_id=message.source_id,
+                            target_id=message.source_id or "unknown",
                             data={
                                 "status": "rejected",
-                                "reason": f"Expected handshake, got {message.message_type}"
+                                "reason": f"Expected handshake, got {message.message_type}",
+                                "server_time": time.time()
                             }
                         )
-                        await conn.send_message(rejection)
+                        try:
+                            await conn.send_message(rejection)
+                        except Exception:
+                            pass  # Ignore errors
                         await conn.close()
                         return
+                    
+                    # We have a valid handshake message, break out of the retry loop
+                    logger.info(f"Received handshake message from {peer_addr} on attempt {retry+1}")
+                    break
+                    
                 except asyncio.TimeoutError:
-                    logger.warning(f"Handshake timeout from {peer_addr}, retries left: {retries-1}")
-                    retries -= 1
-                    timeout += 1.0  # Gradually increase timeout
-                    await asyncio.sleep(0.5)  # Short delay before retry
+                    if retry < retries - 1:  # Don't log on the last retry
+                        logger.warning(f"Handshake timeout ({timeout:.1f}s) from {peer_addr}, attempt {retry+1}/{retries}")
+                        
+                except ConnectionError as e:
+                    logger.warning(f"Connection error during handshake from {peer_addr}: {e}")
+                    await conn.close()
+                    return
+                    
                 except Exception as e:
-                    logger.warning(f"Error during handshake from {peer_addr}: {e}, retries left: {retries-1}")
-                    retries -= 1
-                    await asyncio.sleep(0.5)  # Short delay before retry
+                    logger.warning(f"Error during handshake from {peer_addr}: {e}")
+                    if retry >= retries - 1:  # Last retry
+                        await conn.close()
+                        return
             
-            # If we ran out of retries without a valid handshake
+            # Final validation check
             if not message:
-                logger.warning(f"Handshake failed after 3 attempts from {peer_addr}")
+                logger.warning(f"Handshake failed after {retries} attempts from {peer_addr}")
                 await conn.close()
                 return
                 
@@ -431,23 +518,79 @@ class MessageHandler:
             
             logger.info(f"Handshake completed with node {node_id} at {peer_addr}")
             
-            # Send enhanced handshake response
-            response = Message(
-                message_id=str(uuid.uuid4()),
-                message_type=MessageType.HANDSHAKE,
-                source_id=self.node_id,
-                target_id=node_id,
-                data={
-                    "status": "accepted",
-                    "handshake_id": handshake_id,  # Echo back the handshake ID
-                    "version": "1.0",
-                    "node_type": "planetary",
-                    "timestamp": time.time(),
-                    "server_time": time.time(),
-                    "time_diff": time.time() - timestamp  # Help with time sync
-                }
-            )
-            await conn.send_message(response)
+            # Send enhanced handshake response with retry logic for reliability
+            for attempt in range(3):  # Try up to 3 times
+                try:
+                    response = Message(
+                        message_id=str(uuid.uuid4()),
+                        message_type=MessageType.HANDSHAKE,
+                        source_id=self.node_id,
+                        target_id=node_id,
+                        data={
+                            "status": "accepted",
+                            "handshake_id": handshake_id,  # Echo back the handshake ID
+                            "version": "1.0",
+                            "node_type": "planetary",
+                            "timestamp": time.time(),
+                            "server_time": time.time(),
+                            "time_diff": time.time() - timestamp,  # Help with time sync
+                            "attempt": attempt + 1
+                        }
+                    )
+                    await conn.send_message(response)
+                    
+                    # Introduce a small delay after sending the handshake response 
+                    # to allow the client to process it before continuing
+                    await asyncio.sleep(0.1)
+                    
+                    # Success - break out of retry loop
+                    break
+                    
+                except Exception as e:
+                    if attempt < 2:  # Only log warning for non-final attempts
+                        logger.warning(f"Failed to send handshake response to {node_id} (attempt {attempt+1}/3): {e}")
+                        await asyncio.sleep(0.2)  # Small delay before retry
+                    else:
+                        logger.error(f"Failed to send handshake response to {node_id} after 3 attempts: {e}")
+            
+            # Instead of immediate stability confirmation, slightly defer it and use a safer approach
+            # This helps avoid the race condition that's causing broken pipes
+            async def send_deferred_stability_confirmation():
+                try:
+                    # Wait a bit to let connection stabilize before sending additional messages
+                    await asyncio.sleep(0.5)
+                    
+                    # Check if connection is still valid before sending
+                    if node_id in self.connections and self.connections[node_id].connected:
+                        stability_confirmation = Message(
+                            message_id=str(uuid.uuid4()),
+                            message_type=MessageType.PING,
+                            source_id=self.node_id,
+                            target_id=node_id,
+                            data={
+                                "handshake_confirmed": True,
+                                "timestamp": time.time(),
+                                "message": "Connection established and stable"
+                            }
+                        )
+                        
+                        # Use a shorter timeout for this message to avoid blocking
+                        try:
+                            await asyncio.wait_for(
+                                self.connections[node_id].send_message(stability_confirmation),
+                                timeout=1.0
+                            )
+                            logger.debug(f"Sent deferred stability confirmation to {node_id}")
+                        except (asyncio.TimeoutError, ConnectionError) as e:
+                            logger.debug(f"Couldn't send stability confirmation to {node_id}: {e}")
+                    else:
+                        logger.debug(f"Skipping stability confirmation - connection to {node_id} no longer valid")
+                except Exception as e:
+                    logger.debug(f"Error in deferred stability confirmation for {node_id}: {e}")
+                    # Ignore errors - this is just an optimization
+            
+            # Create the task but don't await it - let it run independently
+            asyncio.create_task(send_deferred_stability_confirmation())
             
             # Process messages with improved error handling
             while conn.connected and self.running:
@@ -600,66 +743,106 @@ class MessageHandler:
                 )
                 await conn.send_message(handshake)
                 
-                # Wait for handshake response with timeout and retries
-                max_handshake_retries = 3
+                # Use improved handshake protocol with reliable wait and timeout strategy
+                max_handshake_retries = 5  # Increased from 3 to 5
                 handshake_retry_count = 0
                 response = None
-                timeout = 5.0
+                base_timeout = 5.0
                 
                 while handshake_retry_count < max_handshake_retries and not response:
+                    # Calculate dynamic timeout with exponential backoff
+                    timeout = base_timeout * (1.5 ** handshake_retry_count)
+                    
                     try:
-                        response = await asyncio.wait_for(conn.receive_message(), timeout=timeout)
+                        # Send handshake with retry counter for debugging
+                        handshake.data["retry"] = handshake_retry_count
+                        handshake.data["timestamp"] = time.time()  # Update timestamp
+                        await conn.send_message(handshake)
                         
-                        if not response:
-                            logger.warning(f"Empty handshake response from node {node_id}, retry {handshake_retry_count+1}/{max_handshake_retries}")
+                        # Wait with clear logging
+                        logger.info(f"Waiting for handshake response from {node_id} (attempt {handshake_retry_count+1}/{max_handshake_retries}, timeout: {timeout:.1f}s)")
+                        
+                        # Improved message receiving with clearer error handling
+                        try:
+                            response = await asyncio.wait_for(conn.receive_message(), timeout=timeout)
+                        except asyncio.CancelledError:
+                            logger.warning(f"Handshake wait cancelled for node {node_id}")
+                            raise
+                        except asyncio.TimeoutError:
+                            logger.warning(f"Timeout ({timeout:.1f}s) waiting for handshake response from {node_id}")
                             handshake_retry_count += 1
-                            timeout += 1.0  # Increase timeout for next retry
+                            await asyncio.sleep(0.5)  # Brief pause between retries
+                            continue
+                        
+                        # Process the response with clear validation steps
+                        if not response:
+                            logger.warning(f"Received empty handshake response from {node_id} (attempt {handshake_retry_count+1}/{max_handshake_retries})")
+                            handshake_retry_count += 1
+                            await asyncio.sleep(0.5)
                             continue
                             
+                        # Step 1: Validate message type
                         if response.message_type != MessageType.HANDSHAKE:
-                            logger.warning(f"Invalid handshake response type from node {node_id}: {response.message_type}")
-                            # Just to be safe, we'll try sending the handshake again
+                            logger.warning(f"Received non-handshake message type from {node_id}: {response.message_type}")
                             handshake_retry_count += 1
                             if handshake_retry_count < max_handshake_retries:
-                                logger.info(f"Resending handshake to node {node_id}, attempt {handshake_retry_count+1}/{max_handshake_retries}")
-                                await conn.send_message(handshake)
+                                await asyncio.sleep(0.5)
                                 continue
                             else:
-                                raise ConnectionError(f"Invalid handshake response type: {response.message_type}")
+                                raise ConnectionError(f"Expected handshake message, got {response.message_type}")
                         
-                        # Verify handshake response data
-                        if not response.data or "status" not in response.data:
-                            logger.warning(f"Missing status in handshake response from node {node_id}")
+                        # Step 2: Validate message source
+                        if response.source_id != node_id:
+                            logger.warning(f"Handshake response from unexpected source: {response.source_id} (expected {node_id})")
                             handshake_retry_count += 1
                             if handshake_retry_count < max_handshake_retries:
-                                logger.info(f"Resending handshake to node {node_id}, attempt {handshake_retry_count+1}/{max_handshake_retries}")
-                                await conn.send_message(handshake)
+                                await asyncio.sleep(0.5)
+                                continue
+                            else:
+                                raise ConnectionError(f"Handshake source mismatch: {response.source_id} vs {node_id}")
+                        
+                        # Step 3: Validate response status
+                        if not response.data or "status" not in response.data:
+                            logger.warning(f"Missing status field in handshake response from {node_id}")
+                            handshake_retry_count += 1
+                            if handshake_retry_count < max_handshake_retries:
+                                await asyncio.sleep(0.5)
                                 continue
                             else:
                                 raise ConnectionError("Missing status in handshake response")
                         
+                        # Step 4: Check acceptance status
                         if response.data.get("status") != "accepted":
-                            logger.warning(f"Handshake rejected by node {node_id}: {response.data.get('reason', 'No reason given')}")
-                            raise ConnectionError(f"Handshake rejected: {response.data.get('reason', 'No reason given')}")
+                            reason = response.data.get("reason", "No reason provided")
+                            logger.warning(f"Handshake rejected by {node_id}: {reason}")
+                            raise ConnectionError(f"Handshake rejected: {reason}")
                         
-                        # Successful handshake, break out of retry loop
+                        # Success! We have a valid handshake response
+                        logger.info(f"Received valid handshake response from {node_id}")
                         break
                         
                     except asyncio.TimeoutError:
+                        # This should not happen due to our inner try-except, but we handle it as a safeguard
                         handshake_retry_count += 1
-                        timeout += 1.0  # Increase timeout for next retry
-                        logger.warning(f"Timeout waiting for handshake response from node {node_id}, retry {handshake_retry_count}/{max_handshake_retries}")
+                        logger.warning(f"Outer timeout waiting for handshake from {node_id} (attempt {handshake_retry_count}/{max_handshake_retries})")
                         
-                        if handshake_retry_count < max_handshake_retries:
-                            logger.info(f"Resending handshake to node {node_id}, attempt {handshake_retry_count+1}/{max_handshake_retries}")
-                            await conn.send_message(handshake)
-                            await asyncio.sleep(0.5)  # Brief delay before next attempt
-                        else:
-                            raise ConnectionError("Handshake response timeout after multiple retries")
+                    except ConnectionError as e:
+                        logger.error(f"Connection error during handshake with {node_id}: {e}")
+                        handshake_retry_count += 1
+                        if handshake_retry_count >= max_handshake_retries:
+                            raise
+                        await asyncio.sleep(1.0)  # Longer delay on connection errors
+                        
+                    except Exception as e:
+                        logger.error(f"Unexpected error during handshake with {node_id}: {e}", exc_info=True)
+                        handshake_retry_count += 1
+                        if handshake_retry_count >= max_handshake_retries:
+                            raise ConnectionError(f"Handshake failed: {e}")
+                        await asyncio.sleep(1.0)
                 
-                # Check if we got a valid response
+                # Final validation check
                 if not response:
-                    raise ConnectionError(f"Failed to get handshake response from node {node_id} after {max_handshake_retries} attempts")
+                    raise ConnectionError(f"Failed to get valid handshake response from {node_id} after {max_handshake_retries} attempts")
                 
                 logger.info(f"Handshake completed with node {node_id}")
                 
