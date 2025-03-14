@@ -32,7 +32,8 @@ class SimulatedPlanet:
     def __init__(self, 
                  planet_id: str,
                  position: Tuple[float, float, float] = None,
-                 node_count: int = 3):
+                 node_count: int = 3,
+                 start_node_port: int = 8000):
         """
         Initialize a simulated planet.
         
@@ -40,11 +41,13 @@ class SimulatedPlanet:
             planet_id: Identifier for the planet
             position: 3D coordinates of the planet (x, y, z) in astronomical units
             node_count: Number of nodes to create on the planet
+            start_node_port: Starting port number for node communication
         """
         self.planet_id = planet_id
         self.position = position or (random.uniform(-10, 10), random.uniform(-10, 10), random.uniform(-10, 10))
         self.nodes: List[PlanetaryNode] = []
         self.node_count = node_count
+        self.start_node_port = start_node_port
         
     async def initialize(self) -> None:
         """Initialize the planet with nodes."""
@@ -68,11 +71,23 @@ class SimulatedPlanet:
                     "known_nodes": []
                 }
                 
-                # Create node
+                # Create node with dynamic port allocation
                 logger.info(f"Instantiating PlanetaryNode for {node_id}")
                 try:
-                    node = PlanetaryNode(node_id=node_id, planet_id=self.planet_id, config=config)
-                    logger.info(f"Successfully created node {node_id}")
+                    # Extract planet number and node index from node_id
+                    planet_num = int(self.planet_id.split('-')[1]) if self.planet_id.split('-')[1].isdigit() else 0
+                    
+                    # Calculate port based on planet number and node index
+                    # This ensures uniqueness even with multiple simulations
+                    node_port = self.start_node_port + (planet_num * 100) + i
+                    
+                    node = PlanetaryNode(
+                        node_id=node_id, 
+                        planet_id=self.planet_id, 
+                        config=config,
+                        port=node_port
+                    )
+                    logger.info(f"Successfully created node {node_id} with port {node_port}")
                 except Exception as e:
                     logger.error(f"Error creating node {node_id}: {e}", exc_info=True)
                     raise
@@ -89,10 +104,14 @@ class SimulatedPlanet:
                 # Add other nodes as known nodes
                 for j, other_node in enumerate(self.nodes):
                     if i != j:
-                        # localhost connection for simulation
+                        # localhost connection for simulation with dynamic port allocation
+                        # Extract planet number from planet_id for port calculation
+                        planet_num = int(self.planet_id.split('-')[1]) if self.planet_id.split('-')[1].isdigit() else 0
+                        node_port = self.start_node_port + (planet_num * 100) + j
+                        
                         connection = {
                             "node_id": other_node.node_id,
-                            "address": f"127.0.0.1:{8000 + j}"
+                            "address": f"127.0.0.1:{node_port}"
                         }
                         node.config["known_nodes"].append(connection)
                         logger.info(f"Added connection from {node.node_id} to {other_node.node_id} at {connection['address']}")
@@ -132,7 +151,8 @@ class SimulationEnvironment:
     def __init__(self, 
                  planet_count: int = 3,
                  nodes_per_planet: int = 3,
-                 latency_model: LatencyModelType = LatencyModelType.REALISTIC):
+                 latency_model: LatencyModelType = LatencyModelType.REALISTIC,
+                 start_node_port: int = 8000):
         """
         Initialize the simulation environment.
         
@@ -140,11 +160,13 @@ class SimulationEnvironment:
             planet_count: Number of planets to simulate
             nodes_per_planet: Number of nodes per planet
             latency_model: Type of latency model to use
+            start_node_port: Starting port number for node communication
         """
         self.planet_count = planet_count
         self.nodes_per_planet = nodes_per_planet
         self.latency_model_type = latency_model
         self.latency_model = InterPlanetaryLatencyModel.create(latency_model)
+        self.start_node_port = start_node_port
         
         # Planets
         self.planets: Dict[str, SimulatedPlanet] = {}
@@ -181,11 +203,12 @@ class SimulationEnvironment:
                     random.uniform(-10, 10)
                 )
                 
-                # Create planet
+                # Create planet with dynamic port allocation
                 planet = SimulatedPlanet(
                     planet_id=planet_id,
                     position=position,
-                    node_count=self.nodes_per_planet
+                    node_count=self.nodes_per_planet,
+                    start_node_port=self.start_node_port
                 )
                 
                 # Initialize planet
@@ -234,15 +257,24 @@ class SimulationEnvironment:
             source_node = random.choice(self.planets[planet_id].nodes)
             target_node = random.choice(self.planets[other_planet_id].nodes)
             
-            # Add as known nodes
+            # Add as known nodes with dynamic port allocation
+            # Extract planet and node indexes for port calculation
+            target_planet_num = int(target_node.planet_id.split('-')[1]) if target_node.planet_id.split('-')[1].isdigit() else 0
+            target_node_num = int(target_node.node_id.split('-')[-1]) if target_node.node_id.split('-')[-1].isdigit() else 0
+            target_port = self.start_node_port + (target_planet_num * 100) + target_node_num
+            
+            source_planet_num = int(source_node.planet_id.split('-')[1]) if source_node.planet_id.split('-')[1].isdigit() else 0
+            source_node_num = int(source_node.node_id.split('-')[-1]) if source_node.node_id.split('-')[-1].isdigit() else 0
+            source_port = self.start_node_port + (source_planet_num * 100) + source_node_num
+            
             source_node.config["known_nodes"].append({
                 "node_id": target_node.node_id,
-                "address": f"127.0.0.1:{8000 + int(target_node.node_id.split('-')[-1])}"
+                "address": f"127.0.0.1:{target_port}"
             })
             
             target_node.config["known_nodes"].append({
                 "node_id": source_node.node_id,
-                "address": f"127.0.0.1:{8000 + int(source_node.node_id.split('-')[-1])}"
+                "address": f"127.0.0.1:{source_port}"
             })
             
         logger.info(f"Setup {len(self.interplanetary_connections)} interplanetary connections")
@@ -513,9 +545,14 @@ class SimulationEnvironment:
         # Reconnect nodes
         for node1, node2 in connections:
             try:
+                # Calculate port using the new formula
+                planet_num = int(node2.planet_id.split('-')[1]) if node2.planet_id.split('-')[1].isdigit() else 0
+                node_num = int(node2.node_id.split('-')[-1]) if node2.node_id.split('-')[-1].isdigit() else 0
+                node_port = self.start_node_port + (planet_num * 100) + node_num
+                
                 await node1.connect_to_node(
                     node2.node_id, 
-                    f"127.0.0.1:{8000 + int(node2.node_id.split('-')[-1])}"
+                    f"127.0.0.1:{node_port}"
                 )
             except Exception as e:
                 logger.error(f"Error reconnecting nodes: {e}")

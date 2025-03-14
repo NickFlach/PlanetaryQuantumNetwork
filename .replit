@@ -13,14 +13,18 @@ author = "agent"
 
 [[workflows.workflow.tasks]]
 task = "workflow.run"
-args = "Server"
+args = "Simulation1"
 
 [[workflows.workflow.tasks]]
 task = "workflow.run"
-args = "simulation_test"
+args = "Simulation2"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "LargeSimulation"
 
 [[workflows.workflow]]
-name = "Server"
+name = "Simulation1"
 author = "agent"
 
 [workflows.workflow.metadata]
@@ -31,11 +35,11 @@ task = "packager.installForAll"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "python main.py --simulation --planet-count 3 --nodes-per-planet 2 --operation-rate 0.5 --duration 3600"
+args = "python main.py --simulation --planet-count 2 --nodes-per-planet 2 --operation-rate 0.5 --duration 3600 --port 5000 --node-port 7000"
 waitForPort = 5000
 
 [[workflows.workflow]]
-name = "simulation_test"
+name = "Simulation2"
 author = "agent"
 
 [workflows.workflow.metadata]
@@ -46,8 +50,87 @@ task = "packager.installForAll"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "python main.py --simulation --planet-count 2 --nodes-per-planet 2 --operation-rate 0.5 --duration 60"
-waitForPort = 5000
+args = "python main.py --simulation --planet-count 2 --nodes-per-planet 2 --operation-rate 0.5 --duration 3600 --port 5001 --node-port 9000"
+waitForPort = 5001
+
+[[workflows.workflow]]
+name = "LargeSimulation"
+author = "agent"
+
+[workflows.workflow.metadata]
+agentRequireRestartOnSave = false
+
+[[workflows.workflow.tasks]]
+task = "packager.installForAll"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python main.py --simulation --planet-count 3 --nodes-per-planet 3 --operation-rate 0.5 --duration 3600 --port 5002 --node-port 8000"
+waitForPort = 5002
 
 [deployment]
-run = ["sh", "-c", "python main.py --simulation --planet-count 3 --nodes-per-planet 2 --operation-rate 0.5 --duration 3600"]
+run = ["sh", "-c", "python main.py --simulation --planet-count 3 --nodes-per-planet 2 --operation-rate 0.5 --duration 3600 --node-port 7000"]
+
+[[ports]]
+localPort = 5000
+externalPort = 5000
+
+[[ports]]
+localPort = 5001
+externalPort = 3002
+
+[[ports]]
+localPort = 7000
+externalPort = 3003
+
+[[ports]]
+localPort = 7001
+externalPort = 4200
+
+[[ports]]
+localPort = 7100
+externalPort = 5173
+
+[[ports]]
+localPort = 7101
+externalPort = 6000
+
+[[ports]]
+localPort = 8000
+externalPort = 80
+
+[[ports]]
+localPort = 8001
+externalPort = 3000
+
+[[ports]]
+localPort = 8002
+externalPort = 8008
+
+[[ports]]
+localPort = 8100
+externalPort = 8080
+
+[[ports]]
+localPort = 8101
+externalPort = 8081
+
+[[ports]]
+localPort = 8102
+externalPort = 8099
+
+[[ports]]
+localPort = 9000
+externalPort = 9000
+
+[[ports]]
+localPort = 9001
+externalPort = 3001
+
+[[ports]]
+localPort = 9100
+externalPort = 6800
+
+[[ports]]
+localPort = 9101
+externalPort = 8000

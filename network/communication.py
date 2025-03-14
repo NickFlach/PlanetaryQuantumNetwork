@@ -64,24 +64,39 @@ class Message:
         
     def to_dict(self) -> Dict[str, Any]:
         """Convert the message to a dictionary."""
+        # Handle binary data by base64 encoding it
+        data = self.data
+        if isinstance(data, bytes):
+            import base64
+            data = {
+                "__binary__": True,
+                "data": base64.b64encode(data).decode('ascii')
+            }
+            
         return {
             "message_id": self.message_id,
             "message_type": self.message_type.value,
             "source_id": self.source_id,
             "target_id": self.target_id,
-            "data": self.data,
+            "data": data,
             "timestamp": self.timestamp
         }
         
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'Message':
         """Create a message from a dictionary."""
+        # Handle binary data conversion
+        message_data = data["data"]
+        if isinstance(message_data, dict) and message_data.get("__binary__", False):
+            import base64
+            message_data = base64.b64decode(message_data["data"])
+        
         return cls(
             message_id=data["message_id"],
             message_type=MessageType(data["message_type"]),
             source_id=data["source_id"],
             target_id=data["target_id"],
-            data=data["data"],
+            data=message_data,
             timestamp=data["timestamp"]
         )
         
@@ -118,19 +133,42 @@ class Connection:
         if not self.connected:
             raise ConnectionError(f"Connection to node {self.node_id} is closed")
             
-        # Serialize the message
-        message_data = json.dumps(message.to_dict()).encode()
-        
+        # Serialize the message with improved error handling
+        try:
+            message_dict = message.to_dict()
+            # Use a more robust JSON serialization with explicit encoding
+            message_data = json.dumps(message_dict, ensure_ascii=False, 
+                                     default=str).encode('utf-8')
+        except Exception as e:
+            logger.error(f"Failed to serialize message to {self.node_id}: {e}, message: {message}")
+            self.connected = False
+            raise ConnectionError(f"Serialization error: {e}")
+            
         # Send the message length first, then the message
         message_length = len(message_data)
         length_bytes = message_length.to_bytes(4, byteorder='big')
         
         try:
-            self.writer.write(length_bytes)
-            self.writer.write(message_data)
-            await self.writer.drain()
-            self.last_activity = time.time()
+            # Combine writes to avoid fragmentation issues
+            combined_data = bytearray(length_bytes)
+            combined_data.extend(message_data)
+            
+            self.writer.write(combined_data)
+            
+            # Use careful error handling for drain
+            try:
+                await asyncio.wait_for(self.writer.drain(), timeout=5.0)
+                self.last_activity = time.time()
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout draining writer for node {self.node_id}")
+                self.connected = False
+                raise ConnectionError(f"Write timeout for node {self.node_id}")
+                
         except (ConnectionError, BrokenPipeError, OSError) as e:
+            self.connected = False
+            raise ConnectionError(f"Failed to send message to node {self.node_id}: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error sending message to {self.node_id}: {e}")
             self.connected = False
             raise ConnectionError(f"Failed to send message to node {self.node_id}: {e}")
             
@@ -145,29 +183,75 @@ class Connection:
             return None
             
         try:
-            # Read message length
-            length_bytes = await self.reader.readexactly(4)
-            message_length = int.from_bytes(length_bytes, byteorder='big')
+            # Use timeout for read operations to avoid hanging indefinitely
+            try:
+                # Read message length with timeout
+                length_bytes = await asyncio.wait_for(
+                    self.reader.readexactly(4), 
+                    timeout=10.0
+                )
+                message_length = int.from_bytes(length_bytes, byteorder='big')
+                
+                # Sanity check for message size
+                if message_length <= 0 or message_length > 10 * 1024 * 1024:  # 10MB max
+                    logger.warning(f"Invalid message length: {message_length} from {self.node_id}")
+                    self.connected = False
+                    return None
+                
+                # Read message data with timeout
+                message_data = await asyncio.wait_for(
+                    self.reader.readexactly(message_length),
+                    timeout=20.0  # Longer timeout for larger messages
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout reading message from {self.node_id}")
+                self.connected = False
+                return None
             
-            # Read message data
-            message_data = await self.reader.readexactly(message_length)
-            
-            # Parse message
-            message_dict = json.loads(message_data.decode())
-            message = Message.from_dict(message_dict)
-            
-            self.last_activity = time.time()
-            return message
+            # Parse message with improved error handling
+            try:
+                # Using a more robust decode process with fallback
+                try:
+                    # First try standard UTF-8 decode
+                    message_str = message_data.decode('utf-8')
+                except UnicodeDecodeError:
+                    # If that fails, use replacement for invalid chars
+                    logger.warning(f"UTF-8 decode failed for message from {self.node_id}, using replacement mode")
+                    message_str = message_data.decode('utf-8', errors='replace')
+                
+                try:
+                    # Try to parse the JSON with strict mode first
+                    message_dict = json.loads(message_str)
+                except json.JSONDecodeError as e:
+                    # Log the error and the problematic JSON
+                    logger.error(f"JSON decode error from {self.node_id}: {e}")
+                    logger.debug(f"Problematic JSON (truncated): {message_str[:200]}")
+                    # Re-raise to be caught by the outer exception handler
+                    raise
+                
+                # Create Message object from the dict
+                message = Message.from_dict(message_dict)
+                
+                self.last_activity = time.time()
+                return message
+                
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                logger.error(f"Failed to decode message from node {self.node_id}: {e}")
+                logger.debug(f"Raw message data (first 100 bytes): {message_data[:100]}")
+                return None
             
         except asyncio.IncompleteReadError:
             # Connection closed
+            logger.warning(f"Connection closed by peer while reading from {self.node_id}")
             self.connected = False
             return None
-        except (ConnectionError, OSError):
+        except (ConnectionError, OSError) as e:
+            logger.warning(f"Connection error while reading from {self.node_id}: {e}")
             self.connected = False
             return None
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to decode message from node {self.node_id}: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error receiving message from {self.node_id}: {e}")
+            self.connected = False
             return None
             
     async def close(self) -> None:
@@ -278,19 +362,66 @@ class MessageHandler:
         logger.info(f"New connection from {peer_addr}")
         
         try:
-            # Wait for handshake message
-            message = await conn.receive_message()
+            # Wait for handshake message with timeout and retries
+            message = None
+            retries = 3
+            timeout = 5.0
             
-            if not message or message.message_type != MessageType.HANDSHAKE:
-                logger.warning(f"Invalid handshake from {peer_addr}")
+            while not message and retries > 0:
+                try:
+                    message = await asyncio.wait_for(conn.receive_message(), timeout=timeout)
+                    
+                    if not message:
+                        logger.warning(f"Empty handshake from {peer_addr}, retries left: {retries-1}")
+                        retries -= 1
+                        timeout += 1.0  # Gradually increase timeout
+                        await asyncio.sleep(0.5)  # Short delay before retry
+                        continue
+                    
+                    if message.message_type != MessageType.HANDSHAKE:
+                        logger.warning(f"Invalid handshake type from {peer_addr}: {message.message_type}")
+                        # Send proper rejection response
+                        rejection = Message(
+                            message_id=str(uuid.uuid4()),
+                            message_type=MessageType.HANDSHAKE,
+                            source_id=self.node_id,
+                            target_id=message.source_id,
+                            data={
+                                "status": "rejected",
+                                "reason": f"Expected handshake, got {message.message_type}"
+                            }
+                        )
+                        await conn.send_message(rejection)
+                        await conn.close()
+                        return
+                except asyncio.TimeoutError:
+                    logger.warning(f"Handshake timeout from {peer_addr}, retries left: {retries-1}")
+                    retries -= 1
+                    timeout += 1.0  # Gradually increase timeout
+                    await asyncio.sleep(0.5)  # Short delay before retry
+                except Exception as e:
+                    logger.warning(f"Error during handshake from {peer_addr}: {e}, retries left: {retries-1}")
+                    retries -= 1
+                    await asyncio.sleep(0.5)  # Short delay before retry
+            
+            # If we ran out of retries without a valid handshake
+            if not message:
+                logger.warning(f"Handshake failed after 3 attempts from {peer_addr}")
                 await conn.close()
                 return
                 
-            # Extract node ID from handshake
+            # Extract node ID and handshake information
             node_id = message.source_id
+            handshake_id = message.data.get("handshake_id", "unknown")
+            client_version = message.data.get("version", "unknown")
+            node_type = message.data.get("node_type", "unknown")
+            timestamp = message.data.get("timestamp", time.time())
+            
+            logger.info(f"Received handshake from node {node_id} (version={client_version}, type={node_type})")
             
             if node_id in self.connections:
-                # Close existing connection
+                # Close existing connection to avoid duplicates
+                logger.info(f"Replacing existing connection for node {node_id}")
                 old_conn = self.connections[node_id]
                 await old_conn.close()
                 
@@ -300,46 +431,96 @@ class MessageHandler:
             
             logger.info(f"Handshake completed with node {node_id} at {peer_addr}")
             
-            # Send handshake response
+            # Send enhanced handshake response
             response = Message(
                 message_id=str(uuid.uuid4()),
                 message_type=MessageType.HANDSHAKE,
                 source_id=self.node_id,
                 target_id=node_id,
-                data={"status": "accepted"}
+                data={
+                    "status": "accepted",
+                    "handshake_id": handshake_id,  # Echo back the handshake ID
+                    "version": "1.0",
+                    "node_type": "planetary",
+                    "timestamp": time.time(),
+                    "server_time": time.time(),
+                    "time_diff": time.time() - timestamp  # Help with time sync
+                }
             )
             await conn.send_message(response)
             
-            # Process messages
+            # Process messages with improved error handling
             while conn.connected and self.running:
-                message = await conn.receive_message()
-                
-                if not message:
+                try:
+                    # Use a heartbeat-based timeout
+                    message = await asyncio.wait_for(conn.receive_message(), timeout=60.0)
+                    
+                    if not message:
+                        logger.info(f"Connection closed by node {node_id}")
+                        break
+                        
+                    # Check if message is for us
+                    if message.target_id != self.node_id:
+                        logger.warning(f"Received message for {message.target_id} from {node_id}")
+                        continue
+                        
+                    # Handle special message types
+                    if message.message_type == MessageType.DISCONNECT:
+                        logger.info(f"Received disconnect from node {node_id}")
+                        # Acknowledge the disconnect
+                        ack = Message(
+                            message_id=str(uuid.uuid4()),
+                            message_type=MessageType.DISCONNECT,
+                            source_id=self.node_id,
+                            target_id=node_id,
+                            data={"status": "acknowledged"}
+                        )
+                        try:
+                            await conn.send_message(ack)
+                        except Exception:
+                            pass  # Ignore errors during disconnect acknowledgment
+                        break
+                        
+                    elif message.message_type == MessageType.PING:
+                        # Respond to ping with enhanced data
+                        response = Message(
+                            message_id=str(uuid.uuid4()),
+                            message_type=MessageType.PONG,
+                            source_id=self.node_id,
+                            target_id=node_id,
+                            data={
+                                "echo": message.data,
+                                "server_time": time.time()
+                            }
+                        )
+                        await conn.send_message(response)
+                        continue
+                        
+                    # Pass to callback
+                    await self._process_message(message)
+                    
+                except asyncio.TimeoutError:
+                    # Connection is idle, send ping to check if it's still alive
+                    try:
+                        ping = Message(
+                            message_id=str(uuid.uuid4()),
+                            message_type=MessageType.PING,
+                            source_id=self.node_id,
+                            target_id=node_id,
+                            data={"timestamp": time.time()}
+                        )
+                        await conn.send_message(ping)
+                    except ConnectionError:
+                        logger.warning(f"Connection to node {node_id} is dead")
+                        break
+                        
+                except ConnectionError as e:
+                    logger.warning(f"Connection error with node {node_id}: {e}")
                     break
                     
-                # Check if message is for us
-                if message.target_id != self.node_id:
-                    logger.warning(f"Received message for {message.target_id} from {node_id}")
-                    continue
-                    
-                # Handle special message types
-                if message.message_type == MessageType.DISCONNECT:
-                    logger.info(f"Received disconnect from node {node_id}")
-                    break
-                elif message.message_type == MessageType.PING:
-                    # Respond to ping
-                    response = Message(
-                        message_id=str(uuid.uuid4()),
-                        message_type=MessageType.PONG,
-                        source_id=self.node_id,
-                        target_id=node_id,
-                        data=message.data
-                    )
-                    await conn.send_message(response)
-                    continue
-                    
-                # Pass to callback
-                await self._process_message(message)
+                except Exception as e:
+                    logger.error(f"Error processing message from node {node_id}: {e}")
+                    # Continue processing despite errors
                 
         except Exception as e:
             logger.error(f"Error handling connection from {peer_addr}: {e}")
@@ -386,46 +567,123 @@ class MessageHandler:
         host, port_str = address.split(":")
         port = int(port_str)
         
-        try:
-            # Connect
-            reader, writer = await asyncio.open_connection(host, port)
-            
-            # Create connection
-            conn = Connection(node_id, reader, writer)
-            self.connections[node_id] = conn
-            
-            logger.info(f"Connected to node {node_id} at {address}")
-            
-            # Send handshake
-            handshake = Message(
-                message_id=str(uuid.uuid4()),
-                message_type=MessageType.HANDSHAKE,
-                source_id=self.node_id,
-                target_id=node_id,
-                data={"version": "1.0"}
-            )
-            await conn.send_message(handshake)
-            
-            # Wait for handshake response
-            response = await conn.receive_message()
-            
-            if not response or response.message_type != MessageType.HANDSHAKE:
-                logger.warning(f"Invalid handshake response from node {node_id}")
-                await conn.close()
-                del self.connections[node_id]
-                raise ConnectionError(f"Invalid handshake response from node {node_id}")
+        # Set up retry parameters
+        max_retries = 3
+        retry_delay = 1.0  # seconds
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                # Connect
+                logger.info(f"Attempting to connect to node {node_id} at {address} (attempt {retry_count+1}/{max_retries})")
+                reader, writer = await asyncio.open_connection(host, port)
                 
-            logger.info(f"Handshake completed with node {node_id}")
-            
-            # Start message processing task
-            self.loop.create_task(self._process_connection(conn))
-            
-        except (ConnectionError, OSError) as e:
-            if node_id in self.connections:
-                await self.connections[node_id].close()
-                del self.connections[node_id]
+                # Create connection
+                conn = Connection(node_id, reader, writer)
+                self.connections[node_id] = conn
                 
-            raise ConnectionError(f"Failed to connect to node {node_id} at {address}: {e}")
+                logger.info(f"Connected to node {node_id} at {address}")
+                
+                # Send handshake with connection identifier
+                handshake_id = str(uuid.uuid4())
+                handshake = Message(
+                    message_id=handshake_id,
+                    message_type=MessageType.HANDSHAKE,
+                    source_id=self.node_id,
+                    target_id=node_id,
+                    data={
+                        "version": "1.0",
+                        "handshake_id": handshake_id,
+                        "node_type": "planetary",
+                        "timestamp": time.time()
+                    }
+                )
+                await conn.send_message(handshake)
+                
+                # Wait for handshake response with timeout and retries
+                max_handshake_retries = 3
+                handshake_retry_count = 0
+                response = None
+                timeout = 5.0
+                
+                while handshake_retry_count < max_handshake_retries and not response:
+                    try:
+                        response = await asyncio.wait_for(conn.receive_message(), timeout=timeout)
+                        
+                        if not response:
+                            logger.warning(f"Empty handshake response from node {node_id}, retry {handshake_retry_count+1}/{max_handshake_retries}")
+                            handshake_retry_count += 1
+                            timeout += 1.0  # Increase timeout for next retry
+                            continue
+                            
+                        if response.message_type != MessageType.HANDSHAKE:
+                            logger.warning(f"Invalid handshake response type from node {node_id}: {response.message_type}")
+                            # Just to be safe, we'll try sending the handshake again
+                            handshake_retry_count += 1
+                            if handshake_retry_count < max_handshake_retries:
+                                logger.info(f"Resending handshake to node {node_id}, attempt {handshake_retry_count+1}/{max_handshake_retries}")
+                                await conn.send_message(handshake)
+                                continue
+                            else:
+                                raise ConnectionError(f"Invalid handshake response type: {response.message_type}")
+                        
+                        # Verify handshake response data
+                        if not response.data or "status" not in response.data:
+                            logger.warning(f"Missing status in handshake response from node {node_id}")
+                            handshake_retry_count += 1
+                            if handshake_retry_count < max_handshake_retries:
+                                logger.info(f"Resending handshake to node {node_id}, attempt {handshake_retry_count+1}/{max_handshake_retries}")
+                                await conn.send_message(handshake)
+                                continue
+                            else:
+                                raise ConnectionError("Missing status in handshake response")
+                        
+                        if response.data.get("status") != "accepted":
+                            logger.warning(f"Handshake rejected by node {node_id}: {response.data.get('reason', 'No reason given')}")
+                            raise ConnectionError(f"Handshake rejected: {response.data.get('reason', 'No reason given')}")
+                        
+                        # Successful handshake, break out of retry loop
+                        break
+                        
+                    except asyncio.TimeoutError:
+                        handshake_retry_count += 1
+                        timeout += 1.0  # Increase timeout for next retry
+                        logger.warning(f"Timeout waiting for handshake response from node {node_id}, retry {handshake_retry_count}/{max_handshake_retries}")
+                        
+                        if handshake_retry_count < max_handshake_retries:
+                            logger.info(f"Resending handshake to node {node_id}, attempt {handshake_retry_count+1}/{max_handshake_retries}")
+                            await conn.send_message(handshake)
+                            await asyncio.sleep(0.5)  # Brief delay before next attempt
+                        else:
+                            raise ConnectionError("Handshake response timeout after multiple retries")
+                
+                # Check if we got a valid response
+                if not response:
+                    raise ConnectionError(f"Failed to get handshake response from node {node_id} after {max_handshake_retries} attempts")
+                
+                logger.info(f"Handshake completed with node {node_id}")
+                
+                # Start message processing task
+                self.loop.create_task(self._process_connection(conn))
+                
+                # Successful connection, return
+                return
+                
+            except (ConnectionError, OSError) as e:
+                if node_id in self.connections:
+                    await self.connections[node_id].close()
+                    del self.connections[node_id]
+                
+                # If we've hit max retries, raise the error
+                retry_count += 1
+                if retry_count >= max_retries:
+                    raise ConnectionError(f"Failed to connect to node {node_id} at {address} after {max_retries} attempts: {e}")
+                
+                # Otherwise, wait and retry
+                logger.info(f"Connection attempt failed ({e}), retrying in {retry_delay} seconds...")
+                await asyncio.sleep(retry_delay)
+                # Increase the delay for the next retry (exponential backoff)
+                retry_delay *= 1.5
             
     async def _process_connection(self, conn: Connection) -> None:
         """

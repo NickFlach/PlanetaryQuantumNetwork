@@ -136,7 +136,9 @@ async def run_simulation(config_file: Optional[str] = None,
                         planet_count: Optional[int] = None,
                         nodes_per_planet: Optional[int] = None,
                         operation_rate: Optional[float] = None,
-                        duration: Optional[int] = None) -> None:
+                        duration: Optional[int] = None,
+                        api_port: Optional[int] = 5000,
+                        start_node_port: Optional[int] = 8000) -> None:
     """
     Run a simulation of the distributed OT network.
     
@@ -178,11 +180,12 @@ async def run_simulation(config_file: Optional[str] = None,
     logger.info(f"Starting simulation with {planet_count} planets, {nodes_per_planet} nodes per planet")
     logger.info(f"Latency model: {latency_model.value}, Operation rate: {operation_rate} ops/s, Duration: {duration}s")
     
-    # Create simulation environment
+    # Create simulation environment with dynamic port allocation
     simulation = SimulationEnvironment(
         planet_count=planet_count,
         nodes_per_planet=nodes_per_planet,
-        latency_model=latency_model
+        latency_model=latency_model,
+        start_node_port=start_node_port
     )
     
     try:
@@ -197,7 +200,7 @@ async def run_simulation(config_file: Optional[str] = None,
         api_server = APIServer(
             node=first_node,
             host="0.0.0.0",
-            port=5000,
+            port=api_port,
             cors_origins=["*"],
             allow_anonymous=True
         )
@@ -205,7 +208,7 @@ async def run_simulation(config_file: Optional[str] = None,
         # Start API server
         await api_server.start()
         
-        logger.info(f"API server running at http://0.0.0.0:5000")
+        logger.info(f"API server running at http://0.0.0.0:{api_port}")
         logger.info("Running simulation...")
         
         # Run simulation
@@ -262,13 +265,20 @@ async def main():
     
     try:
         if args.simulation:
-            # Run simulation
+            # Run simulation with port parameter to avoid conflicts
+            # Use args.port if provided, otherwise default to 5000
+            api_port = args.port if args.port else 5000
+            # Use args.node_port if provided, otherwise default to 8000
+            node_port = args.node_port if args.node_port else 8000
+            
             await run_simulation(
                 config_file=args.config,
                 planet_count=args.planet_count,
                 nodes_per_planet=args.nodes_per_planet,
                 operation_rate=args.operation_rate,
-                duration=args.duration
+                duration=args.duration,
+                api_port=api_port,
+                start_node_port=node_port
             )
         else:
             # Run node
