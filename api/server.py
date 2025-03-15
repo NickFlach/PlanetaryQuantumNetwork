@@ -20,11 +20,14 @@ import asyncio
 import hashlib
 import hmac
 import base64
+import pathlib
 from typing import Dict, List, Any, Optional, Set, Union
 
 import aiohttp
 from aiohttp import web
 import aiohttp_cors
+import jinja2
+import aiohttp_jinja2
 
 from core.ot_engine import Operation, InterPlanetaryOTEngine
 from network.planetary_node import PlanetaryNode
@@ -60,6 +63,11 @@ class APIServer:
         
         # Web application
         self.app = web.Application()
+        
+        # Setup Jinja2 templates
+        templates_path = pathlib.Path(__file__).parent / "templates"
+        loader = jinja2.FileSystemLoader(str(templates_path))
+        aiohttp_jinja2.setup(self.app, loader=loader)
         
         # Active WebSocket connections
         self.ws_connections: Dict[str, Dict[str, web.WebSocketResponse]] = {}
@@ -176,12 +184,34 @@ class APIServer:
         
     async def handle_index(self, request: web.Request) -> web.Response:
         """Handle index route."""
-        return web.json_response({
-            "name": "Distributed OT Network API",
-            "version": "1.0.0",
-            "status": "running",
-            "planet": self.node.planet_id
-        })
+        # For API clients that expect JSON
+        if request.headers.get('Accept') == 'application/json':
+            return web.json_response({
+                "name": "Distributed OT Network API",
+                "version": "1.0.0",
+                "status": "running",
+                "planet": self.node.planet_id
+            })
+        
+        # For browsers, serve the dashboard HTML
+        try:
+            with open(os.path.join(os.path.dirname(__file__), 'templates', 'dashboard.html'), 'r') as f:
+                html_content = f.read()
+            return web.Response(text=html_content, content_type='text/html')
+        except Exception as e:
+            logger.error(f"Error serving dashboard: {e}")
+            return web.Response(text=f"""
+            <html>
+                <head><title>Distributed OT Network</title></head>
+                <body>
+                    <h1>Distributed OT Network</h1>
+                    <p>Planet: {self.node.planet_id}</p>
+                    <p>Node: {self.node.node_id}</p>
+                    <p>Status: Running</p>
+                    <p style="color: red;">Error loading dashboard: {str(e)}</p>
+                </body>
+            </html>
+            """, content_type='text/html')
         
     async def handle_status(self, request: web.Request) -> web.Response:
         """Handle status route."""

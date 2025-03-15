@@ -23,6 +23,34 @@ args = "Simulation2"
 task = "workflow.run"
 args = "LargeSimulation"
 
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "SimpleServer"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "WebDashboard"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Dashboard"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "ReliableDashboard"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "MockSINAPI"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "StandaloneDashboard"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "UltraDashboard"
+
 [[workflows.workflow]]
 name = "Simulation1"
 author = "agent"
@@ -67,6 +95,111 @@ task = "packager.installForAll"
 task = "shell.exec"
 args = "python main.py --simulation --planet-count 3 --nodes-per-planet 3 --operation-rate 0.5 --duration 3600 --port 5002 --node-port 8000"
 waitForPort = 5002
+
+[[workflows.workflow]]
+name = "SimpleServer"
+author = "agent"
+
+[workflows.workflow.metadata]
+agentRequireRestartOnSave = false
+
+[[workflows.workflow.tasks]]
+task = "packager.installForAll"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python simple_server.py"
+waitForPort = 5500
+
+[[workflows.workflow]]
+name = "WebDashboard"
+author = "agent"
+
+[workflows.workflow.metadata]
+agentRequireRestartOnSave = false
+
+[[workflows.workflow.tasks]]
+task = "packager.installForAll"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python simple_dashboard.py"
+waitForPort = 4000
+
+[[workflows.workflow]]
+name = "Dashboard"
+author = "agent"
+
+[workflows.workflow.metadata]
+agentRequireRestartOnSave = false
+
+[[workflows.workflow.tasks]]
+task = "packager.installForAll"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python dashboard_server.py"
+waitForPort = 3000
+
+[[workflows.workflow]]
+name = "ReliableDashboard"
+author = "agent"
+
+[workflows.workflow.metadata]
+agentRequireRestartOnSave = false
+
+[[workflows.workflow.tasks]]
+task = "packager.installForAll"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python reliable_dashboard.py"
+waitForPort = 4000
+
+[[workflows.workflow]]
+name = "MockSINAPI"
+author = "agent"
+
+[workflows.workflow.metadata]
+agentRequireRestartOnSave = false
+
+[[workflows.workflow.tasks]]
+task = "packager.installForAll"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python patch_sin_integration.py"
+waitForPort = 8080
+
+[[workflows.workflow]]
+name = "StandaloneDashboard"
+author = "agent"
+
+[workflows.workflow.metadata]
+agentRequireRestartOnSave = false
+
+[[workflows.workflow.tasks]]
+task = "packager.installForAll"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python standalone_dashboard.py"
+waitForPort = 3000
+
+[[workflows.workflow]]
+name = "UltraDashboard"
+author = "agent"
+
+[workflows.workflow.metadata]
+agentRequireRestartOnSave = false
+
+[[workflows.workflow.tasks]]
+task = "packager.installForAll"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python ultra_reliable_dashboard.py"
+waitForPort = 4000
 
 [deployment]
 run = ["sh", "-c", "python main.py --simulation --planet-count 3 --nodes-per-planet 2 --operation-rate 0.5 --duration 3600 --node-port 7000"]
