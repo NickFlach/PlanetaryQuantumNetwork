@@ -43,7 +43,7 @@ class SINClient:
             api_key: API key for authentication
             verify_ssl: Whether to verify SSL certificates
         """
-        self.api_endpoint = api_endpoint or os.getenv("SIN_API_ENDPOINT", "http://localhost:8080")
+        self.api_endpoint = api_endpoint or os.getenv("SIN_API_ENDPOINT", "https://sin-flaukowski.replit.app")
         self.api_key = api_key or os.getenv("SIN_API_KEY", "test-api-key")
         self.verify_ssl = verify_ssl
         self.session = None

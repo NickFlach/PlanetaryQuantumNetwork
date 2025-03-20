@@ -90,7 +90,7 @@ class Config:
             
             # SIN integration configuration
             "sin": {
-                "api_endpoint": os.getenv("SIN_API_ENDPOINT", "https://api.sin.example.com"),
+                "api_endpoint": os.getenv("SIN_API_ENDPOINT", "https://sin-flaukowski.replit.app"),
                 "api_key": os.getenv("SIN_API_KEY", ""),
                 "verify_ssl": True,
                 "sync_interval": 30  # Synchronization interval in seconds
